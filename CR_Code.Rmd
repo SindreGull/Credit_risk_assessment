@@ -1,0 +1,494 @@
+---
+title: "Compulsory Exercise 2: Credit risk"
+author:
+  - "Håvard Moseby"
+  - "Sindre Skau Gulliksrud"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    toc: no
+    toc_depth: '2'
+header-includes:
+  - \usepackage{amsmath}
+urlcolor: blue
+abstract: " In this project, we aim to classify defaults versus non-defaults using a publicly available credit-risk dataset consisting of multiple predictors and a binary response variable. After performing the necessary data preprocessing and visualizing the distributions graphically, we split the data into training set containing 80% of the data and a test set of 20%. On the training set, we implemented two methods: Logistic Regression with Lasso regularization to reduce high bias, and XGBoost. Both models were tuned using 5-fold cross-validation to optimize their respective hyperparameters. By evaluating performance using AUC and F1-score, we found that XGBoost achieved higher predictive accuracy and a better balance between precision and recall compared to the Lasso-logistic model. Additionally, our analysis provided insights into which predictors were most correlated with the default outcome, offering valuable guidance for credit-risk assessment."
+---
+  
+```{r setup, include=FALSE}
+library(knitr)
+# Feel free to change the setting as you see fit
+knitr::opts_chunk$set(echo = TRUE,
+                      tidy = FALSE,
+                      message = FALSE,
+                      warning = FALSE,
+                      strip.white = TRUE,
+                      prompt = FALSE,
+                      cache = TRUE,
+                      size = "scriptsize",
+                      fig.width = 4,
+                      fig.height = 3,
+                      fig.align = "center")
+
+
+```
+
+```{r, eval=TRUE, echo=FALSE}
+#install.packages('GGally')
+#install.packages("cowplot")
+#install.paclages("reshape2")
+#install.packages("glmnet")    # install if needed
+#install.packages("pROC")      # for AUC
+#install.packages("caret")
+#install.packages("xgboost")
+library("knitr")
+library("rmarkdown")
+library("ggplot2")
+library("cowplot")
+library("GGally")
+library("reshape2")
+library("dplyr")
+library("glmnet")
+library("caret")
+library("pROC")
+library("xgboost")
+
+```
+## Introduction
+In the modern economy, characterized by high inflation and rising interest rates, banks face a challenging task in determining who are suitable candidates for home loans and how much credit they can safely extend. The core responsibility of the banks, in relation to mortgage loans, is to identify individuals who are unlikely to default, thus minimizing losses and ensuring profits.
+
+By examining a publicly available credit-risk data set, we aim to identify significant predictors such as income, employment status and credit history. We will also compare various classification methods to determine which model offers the most accurate predictions of default risk. 
+
+This topic is especially relevant for banks, but also for students and other young borrowers who often have little or no credit history. These individuals may face uncertainty when it comes to stable income and their ability to repay a loan. By understanding what makes someone more likely to default, banks can make better lending decisions, while young borrowers can better understand what factors affect their chances of getting a loan.
+
+## Descriptive data analysis/statistics
+
+```{r data analysis, eval=TRUE,echo=FALSE,fig.width=12, fig.height=12}
+
+df <- read.csv("credit_risk_dataset.csv", header = TRUE, sep = ",")
+#først, filtrer bort urealistiske aldre:
+df <- df[df$person_age <= 122, ]
+
+#endrer loan status
+df$loan_status <- factor(df$loan_status, 
+                         levels = c(0, 1),
+                         labels = c("No Default", "Default"))
+
+#fjern alle rader med NA i noen variabler:
+df <- na.omit(df)
+summary(df)
+
+# 1. Histogram for alder med to overliggende histogrammer
+p_age_hist <- ggplot(df, aes(x = person_age, fill = factor(loan_status))) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 30, color="black") +
+  labs(title = "Age Distribution: Default vs. Not Default",
+       x = "Age",
+       y = "Count",
+       fill = "Loan Status ") +
+  theme_minimal()
+
+p_income_box <- ggplot(df, aes(x = factor(loan_status), y = person_income, fill = factor(loan_status))) +
+  geom_boxplot(alpha=0.7, outlier.shape = 1, outlier.alpha = 0.7) +
+  labs(title = "Income by Loan Status",
+       x = "Loan Status",
+       y = "Income") +
+  scale_y_continuous(limits = c(0, quantile(df$person_income, 0.99))) + #klipp vekk outliers i plot
+  theme_minimal() +
+  theme(legend.position = "none")
+#lage boksplott
+amountplot <- ggplot(df, aes(x = loan_grade, y = loan_amnt)) +
+  geom_boxplot(fill="lightblue") +
+  labs(title = "Loan Amount by Loan Grade",
+       x = "Loan Grade", 
+       y = "Loan Amount") +
+  theme_minimal()
+
+
+p_loan_box<-ggplot(df, aes(x=factor(loan_status), y=loan_amnt, fill=factor(loan_status))) +
+  geom_boxplot() +
+  labs(title = "Loan Amount by Loan Status",
+       x = "Loan Status",
+       y = "Loan Amount") +
+  theme_minimal() +
+  theme(legend.position = "none")
+log_plot<-ggplot(df, aes(x = person_income, y = loan_amnt, color = loan_status)) +
+  geom_point(alpha = 0.6) +  geom_smooth(method = "loess", se = FALSE) + 
+  labs(title = "Income vs. Loan Amount by Loan Status in log-scale",
+       x = "Income",
+       y = "Loan Amount",
+       color = "Loan Status") +
+  theme_minimal()+ scale_x_log10() + scale_y_log10()
+
+# 1) Opprett df_numeric med ønskede kolonner:
+df_numeric <- df %>% 
+  mutate(loan_status_num = ifelse(loan_status == "Default", 1, 0)) %>%
+  select(person_age, 
+         person_income, 
+         loan_amnt, 
+         loan_int_rate,
+         loan_percent_income, 
+         cb_person_cred_hist_length, 
+         loan_status_num)
+
+# 2) Gi kolonnene lettere leselige navn:
+colnames(df_numeric) <- c(
+  "Age",            # person_age
+  "Income",         # person_income
+  "LoanAmount",     # loan_amnt
+  "InterestRate",   # loan_int_rate
+  "PctIncome",      # loan_percent_income
+  "CreditHistLen",  # cb_person_cred_hist_length
+  "DefaultStatus"   # loan_status_num
+)
+
+# 3) Beregn korrelasjonsmatrise med de nye kolonnenavnene:
+cor_mat <- cor(df_numeric, use = "complete.obs")
+
+# 4) Melt matrisen for plotting
+melted_cor <- melt(round(cor_mat, 2))
+
+# 5) Plot heatmap:
+p_cor <- ggplot(melted_cor, aes(Var1, Var2, fill = value)) +
+  geom_tile(color="white") +
+  scale_fill_gradient2(low = "red", high = "blue", mid = "white", 
+                       midpoint = 0, limit = c(-1, 1), 
+                       name = "Corr") +
+  theme_minimal(base_size = 11) +
+  labs(title = "Correlation Matrix: Credit Risk Dataset",
+       x = "", 
+       y = "") +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    legend.position = "right",
+    panel.grid = element_blank()
+  ) +
+  coord_fixed()
+
+
+
+
+#sett dem side ved side:
+plot_grid(p_age_hist,p_income_box,amountplot,p_loan_box,log_plot, p_cor, nrow = 3, ncol = 2)
+
+```
+
+
+Before our analysis, we removed rows with deficient data points, leaving us with 28,634 observations. The dataset includes the variables age, income, home ownership, loan intent, loan grade, employment length, loan amount, interest rate, loan status, percent income, historical default, and credit history length.
+
+Since we aim to predict loan status, it is worth noting that this variable is somewhat imbalanced (only 6,203 defaulted loans out of 28,634). This class imbalance may influence our choice of modeling methods and performance metrics, as accuracy alone might not fully capture the model’s performance on the minority class.
+
+The histogram of age shows that the dataset largely consists of younger adults. From the boxplots comparing default vs. no default, we see indications that lower income and higher loan amounts are associated with a higher proportion of defaults. 
+
+When examining loan amount by loan grade, we observe that the grades D, F, and G are linked to higher loan amounts than A, B, and C. This seems counterintuitive, as a higher letter grade is meant to signify “better” creditworthiness. It may be that these specific grades reflect different loan products, or that riskier borrowers are taking out larger loans. This will be interesting to investigate further.
+
+Finally, in our correlation matrix, we see some moderate correlation between variables. This suggests potential predictive value in several covariates, though we also need to be mindful of possible multicollinearity if certain pairs of predictors are strongly correlated. We can see in the scatter plot for Income vs. Loan amount that higher income correlates strong with high loan amount.
+
+Overall, the exploratory plots and summary statistics provide a good starting point for model building and indicate that variables such as income, loan amount, and credit history are likely to be important for predicting default
+
+
+
+## Methods
+
+### Logistic regression
+
+In this project, we will look at two different methods to predict default status.
+Our first model is logistic regression with a binomial response $Y \in \{0,1\}$. Specifically, we model the probability $p = P(Y = 1 \mid \mathbf{X})$ using the logit link function:
+
+$$
+\log\!\biggl(\tfrac{p}{1-p}\biggr) 
+= \beta_{0} + \beta_{1}X_{1} + \cdots + \beta_{p}X_{p}.
+$$
+
+Here, $\beta_{0}, \dots, \beta_{p}$ are coefficients determined by maximizing the penalized log-likelihood. The link function ensures $p \in (0,1)$.
+
+
+To perform variable selection and prevent overfitting, we include an $\ell_1$-penalty, ie. Lasso regularization. 
+
+The optimization problem then becomes:
+
+$$
+\max_{\beta}\ \ell(\beta) - \lambda \sum_{j=1}^{p} \lvert \beta_j\rvert,
+$$
+where $\ell(\beta)=\sum_{j=1}^{n}(y_i \log(p_i)+(1-y_i)\log(1-p_i))$ is the usual log-likelihood for logistic regression with $$p_i = \frac{1}{1 + \exp\left(-\left(\beta_0 + \beta_1 X_{1,i} + \cdots + \beta_p X_{p,i}\right)\right)}$$, and $\lambda \ge 0$ controls the strength of regularization. 
+
+Large $\lambda$ values shrink more coefficients toward zero, effectively removing less important predictors. 
+
+A key advantage of using Lasso is that it can handle potential multicollinearity and automatically select a subset of relevant features. 
+However, it also introduces a small bias in the estimates. In addition when using logistic regression we assume independent observations.                                                                                                                                                                                               
+We find it particularly appealing for this problem given the relatively large set of potential predictors in our dataset (e.g., age, income, loan amount). Since some of our data has outliers, such as income, we will use the log function for those parameters.
+
+
+
+
+### Gradient boost
+
+
+When comparing the logistic regression model, we will use one of the strongest learning ideas that is currently around, XGB boosting. Boosting builds trees (weak classifiers) sequentially, where each new tree is designed to correct the errors made by the previous trees, this is called boosting. The final prediction will be a combination of the contribution of all the trees. Mathematically this can be expressed as:
+
+$$
+\hat y_i= \sum_{k=1}^K f_k(x_i)
+$$
+where $K$ is the total number of trees and $f_k$ represent a decision tree.
+
+XGBoost uses a gradient descent optimization method to minimize an objective function that consists of two parts: the loss function and a regularization term. The objective function is given by:
+
+$$
+L(\phi)=\sum_{i=1}^n \ell(y_i, \hat y_i)+\sum_{k=1}^K\Omega(f_k)
+$$
+where 
+- $\ell(y_i, \hat y_i)= -[y_i \log \hat{(y_i)}+(1-y_i) \log {(1-\hat y_i)})]$ is the convex function that measures the difference between the actual outcome and the predicted outcome.
+- $\Omega(f_k) = \gamma T_k + \frac{1}{2}\lambda \|w_k\|^2$ is the regulation term where $\lambda, \gamma$ is hyperparameters that penalize overly complex trees. $T_k$ is the number of leaves in the $K-th$ tree. $w_k$ is the vector of scores assigned to each leaf in that tree. In other words, each leaf node receives a weight (or score), and these weights determine the contribution of the leaf to the final prediction. When implementing XGBoost model, we use 5-fold CV the find the optimal hyperparameters, as in logistic regression. 
+
+In practice, when deciding how to split a node, we use a Gain-function. Let $G_L, G_R$ be the sums of gradients in the left and right child nodes, and $H_L, H_R$ are the sums of corresponding Hessian. The Gain from a potential split is computed as:
+
+$$
+Gain = \frac{1}{2}\left[ 
+\frac{G_L^2}{H_L + \lambda} + \frac{G_R^2}{H_R + \lambda} - \frac{(G_L + G_R)^2}{H_L + H_R + \lambda} 
+\right] - \gamma
+$$
+This Gain-function indicates whether it is beneficial to split a node. If the gain is less than $\gamma$, it is better not to perform the split. Since the algorithm is greedy, it uses weighted quantiles to quickly find the optimal split.
+
+One of the strengths of XGBoost is that it can handle large datasets efficiently. Although boosting can be prone to overfitting on very small datasets, with our 28,634 data points it is expected to perform very well, even though XGBoost is capable of scaling to millions or billions of observations. 
+
+In comparison to logistic regression, XGBoost requires more careful tuning of hyperparameters. XGBoost can also be more computationally intensive.
+
+### Implementation of our methods
+
+To train and evaluate our models on this credit-risk dataset, we first randomly split the data into a training set (80%) and a test set (20%). We used  the training set for both fitting the models and performing hyperparameter tuning via 5-fold cross-validation (CV). For Logistic regression with Lasso we selected the $\lambda$ that yielded the best average CV performance, and used it in our final model.
+
+For XGBoost we tuned number of boosting rounds and kept the other hyperparameters fixed. We tried up to 200 rounds and applied early stopping at 10 rounds of no improvement. We then chose the iteration that yields the highest mean AUC. Finally, we take the corresponding best_iteration and train our final XGBoost model on the entire training set. Both models are then evaluated on the test set to assess their performance, keeping the test data fully separate until this final step.
+
+When evaluating the two models, we considered metrics such as AUC and F1-score,both of which are less sensitive to skewed class distributions than just accuracy alone. AUC-score(Area Under Curve) measures how well the model ranks defaults above non-defaults across all possible classification thresholds. 
+
+F1-score, however, combines precision (the fraction of predicted defaults that are truly defaults) and recall (the fraction of all actual defaults the model captures) into a single metric. This makes it especially relevant for our imbalanced credit-risk data, where a high accuracy alone can be misleading if the model overwhelmingly predicts “No Default".
+
+Even though our dataset is skewed, with far fewer defaults than non-defaults, we kept the classification threshold at 0.5.
+
+
+## Results and interpretation
+
+
+```{r models, eval=TRUE, echo=FALSE}
+
+
+df$loan_status_num <- ifelse(df$loan_status == "Default", 1, 0) #endrer tilbake
+df$log_income <- log(df$person_income) #log av income siden vi har outliers
+
+X<-model.matrix(loan_status_num ~ person_age + log_income + loan_amnt + loan_grade +loan_int_rate+loan_percent_income+person_emp_length+ cb_person_cred_hist_length+cb_person_default_on_file+person_home_ownership,data = df)[, -1] #lager model matrisen
+Y<-df$loan_status_num #respons
+
+#train vs. test
+set.seed(212)
+n<-nrow(df)
+train_idx<-sample(seq_len(n),size=0.8*n)
+train_x<- X[train_idx,]
+train_y<-Y[train_idx]
+test_x <- X[-train_idx,]
+test_y<- Y[-train_idx]
+
+#CV for lambda
+cv_fit <- cv.glmnet(
+   x = train_x,
+  y = train_y,
+  alpha = 1,
+  family = "binomial",
+  nfolds = 5          # 5-fold CV 
+)
+
+best_lambda <- cv_fit$lambda.min
+
+
+#lasso
+model_lasso<- glmnet(
+  x=train_x,
+  y=train_y,
+  alpha=1,
+  family = "binomial",
+  lambda = best_lambda
+)
+#opprett en DMatrix for train og test
+dtrain <- xgb.DMatrix(data = X[train_idx,], label = Y[train_idx])
+dtest<- xgb.DMatrix(data = X[-train_idx,], label = Y[-train_idx])
+
+#sett opp parametere for binær klassifisering
+params <- list(
+  objective = "binary:logistic",  #for logistisk tapfunksjon
+  eval_metric = "auc",            #evaluerer med AUC
+  eta = 0.1,                      #læringsrate
+  max_depth = 6,                  #maksimal dybde på trærne
+  subsample = 0.8,                #andel av data for hver boosting-runde
+  colsample_bytree = 0.8          #andel av kolonner brukt per tre
+)
+
+#kryssvalidering for å finne optimalt antall boosting-runder (nrounds)
+cv_results <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 200,           #maks antall runder
+  nfold = 5,               #5-fold kryssvalidering
+  early_stopping_rounds = 10,  #stopper tidlig hvis ingen forbedring
+  verbose = 0,
+  maximize = TRUE          #ønsker å maksimere AUC
+)
+
+
+
+#tren den endelige modellen med optimal nrounds
+final_model_xgb <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = cv_results$best_iteration)
+
+
+```
+### Logistic regression 
+
+```{r results_imporantce, eval=TRUE, echo=FALSE}
+
+
+#prediction
+dtest <- xgb.DMatrix(data = X[-train_idx,], label = Y[-train_idx])
+pred_prob_lasso <- predict(model_lasso, newx = test_x, type = "response")
+pred_prob_xgb <- predict(final_model_xgb, newdata = dtest)
+class_predictions_lasso <- ifelse(pred_prob_lasso > 0.5, 1, 0)
+class_predictions_xgb <- ifelse(pred_prob_xgb > 0.5, 1, 0)
+
+
+
+
+#F1-score for lasso
+conf_mat_lasso <- confusionMatrix(
+  factor(class_predictions_lasso, levels = c(0, 1)),
+  factor(test_y, levels = c(0, 1))
+)
+conf_mat_lasso
+precision_lasso <- conf_mat_lasso$byClass["Pos Pred Value"]
+recall_lasso    <- conf_mat_lasso$byClass["Sensitivity"]
+f1_score_lasso  <- 2 * (precision_lasso * recall_lasso) / (precision_lasso + recall_lasso)
+
+cat("F1-score on Test Set for Logistic regression:", f1_score_lasso, "\n")
+
+```
+
+```{r lambda, eval=TRUE, echo=FALSE, fig.width=12, fig.height=6}
+#plot CV-kurven for lambda
+par(mfrow = c(1, 2))
+plot(cv_fit, main = "")
+abline(v = log(cv_fit$lambda.min), col = "red", lty = 4)
+title("CV curve for lambda", line = 2.5)
+legend("bottomright", legend = paste("best_lambda:", round(log(best_lambda),2)), col = "red", lty = 4, bty = "n")
+plot(cv_fit$glmnet.fit, xvar = "lambda", label = TRUE, main = "")
+abline(v = log(cv_fit$lambda.min), col = "red", lty = 2)
+title("Coefficient Path", line = 2.5)
+legend("topright", legend = paste("best_lambda:", round(log(best_lambda),2)), col = "red", lty = 4, bty = "n")
+par(mfrow = c(1, 1))
+coefs <- coef(cv_fit, s = "lambda.min")
+coefs_df <- data.frame(
+  Predictor = rownames(coefs),
+  Coefficient = as.vector(coefs)
+)
+coefs_df <- coefs_df[coefs_df$Predictor != "(Intercept)", ]
+coefs_df <- coefs_df[order(coefs_df$Coefficient), ]
+ggplot(coefs_df, aes(x = reorder(Predictor, Coefficient), y = Coefficient)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(title = "Lasso Logistic Regression: Coefficients",
+       x = "Predictor",
+       y = "Coefficient Value") +
+  theme_minimal()
+```
+
+
+
+### XGBoost
+
+```{r xgboost, eval=TRUE, echo=FALSE}
+
+#F1 score for xgb
+cm_xgb <- confusionMatrix(factor(class_predictions_xgb, levels = c(0,1)), 
+                      factor(test_y, levels = c(0,1)))
+cm_xgb
+
+#extract precision (Positive Predictive Value) and recall (Sensitivity)
+precision_xgb <- cm_xgb$byClass["Pos Pred Value"]
+recall_xgb    <- cm_xgb$byClass["Sensitivity"]
+
+#compute the F1-score
+F1_score_xgb <- 2 * (precision_xgb * recall_xgb) / (precision_xgb + recall_xgb)
+
+cat("F1-score on Test Set for XGboost:", F1_score_xgb, "\n")
+  #Boosting
+ggplot( cv_results$evaluation_log, aes(x = iter, y = test_auc_mean)) +
+  geom_line(color = "red") +
+  geom_vline(xintercept = cv_results$best_iteration, linetype = "dashed", legend="Nrounds") +
+  geom_point(color = "red") +
+  labs(title = "CV AUC over boosting rounds for XGBoost",
+       subtitle = paste("Optimal nrounds =", cv_results$best_iteration),
+       x = "Number of rounds",
+       y = "Test AUC")+
+  theme_minimal()
+
+
+
+
+```
+```{r imporantce, eval=TRUE, echo=FALSE,fig.width=12, fig.height=6}
+#relative viktighet koeffisenter
+importance <- xgb.importance(model = final_model_xgb)
+gg <- xgb.ggplot.importance(importance, rel_to_first = TRUE, xlab = "Relative Importance")
+gg + labs(title = "XGBoost Feature Importance")
+
+```
+### Comparison
+
+```{r comp, eval=TRUE, echo=FALSE}
+
+
+#prediction
+dtest <- xgb.DMatrix(data = X[-train_idx,], label = Y[-train_idx])
+pred_prob_lasso <- predict(model_lasso, newx = test_x, type = "response")
+pred_prob_xgb <- predict(final_model_xgb, newdata = dtest)
+class_predictions_lasso <- ifelse(pred_prob_lasso > 0.5, 1, 0)
+class_predictions_xgb <- ifelse(pred_prob_xgb > 0.5, 1, 0)
+
+
+#AUC
+roc_obj_lasso <- roc(test_y, pred_prob_lasso)
+roc_obj_xgb <- roc(test_y, pred_prob_xgb)
+plot(roc_obj_xgb, col = "blue", 
+     main = "ROC Curve Comparison", 
+     legacy.axes = TRUE)
+lines(roc_obj_lasso, col = "red")
+legend("bottomright", 
+       legend = c(paste("XGBoost (AUC =", round(auc(roc_obj_xgb), 2), ")"),
+                  paste("Lasso (AUC =", round(auc(roc_obj_lasso), 2), ")")),
+       col = c("blue", "red"), 
+       lwd = 2,
+       cex=0.8)
+```
+
+### Interpretation
+
+Both models were evaluated on the credit risk classification task, and the results indicate that the XGBoost model achieved overall better predictive performance than the logistic regression with Lasso regularization. XGBoost obtained a higher AUC and a slightly higher F1-score, and thus showcased its  ability to distinguish defaulters from non-defaulters and maintain a good balance between precision and recall. The confusion matrices highlight that XGBoost had a higher specificity, meaning fewer false positives, contributing to a more balanced accuracy between the classes. In contrast, the Lasso-regularized logistic model, while performing well with a high F1-score, showed somewhat lower specificity. It detected most of the defaults, but at the cost of more false alarms. Thus, in terms of pure predictive metrics, XGBoost provided more accurate and balanced classifications of credit risk in this case. 
+
+However, this improved performance comes with trade-offs. One of them being the computational cost and model complexity. Logistic regression with Lasso is relatively simple and computationally lightweight. Training involves convex optimization and the Lasso penalty automatically performs feature selection by shrinking less important coefficients to zero. This simplicity means the logistic model is quick to train and easy to tune. Using CV we found the optimized value of  $\lambda$. As the Coefficient-plot indicates, most of the parameters are still close to their original value.
+
+XGBoost, on the other hand, is an ensemble of many decision trees and is significantly more complex. It required careful hyperparameter tuning (number of boosting rounds) and uses techniques like early stopping to prevent overfitting. We therefore found the optimal value of boosted rounds. Training XGBoost was more computationally intensive and time-consuming compared to the logistic model. In this project’s dataset, containing tens of thousands of records, the computational cost was still manageable, but in general XGBoost scales less easily to extremely large datasets or very high dimensional data without substantial computing resources compared to logistic regression. Thus, logistic regression wins on efficiency and simplicity, whereas XGBoost expends more computation to achieve higher accuracy.
+
+XGBoost’s complexity also reflects its greater flexibility. The logistic model is a generalized linear model assuming a linear relationship between features and the log-odds of default, which can impose a strong bias. If the true relationship between predictors and default risk is nonlinear or involves complex interactions, a simple logistic model may have high bias because it cannot capture those patterns unless they are manually encoded. 
+In contrast, XGBoost can naturally model the nonlinear effects and interactions among features through its tree-based structure. This flexibility allows XGBoost to fit the training data more closely and therefore reduce the bias. However,the downside is that such a flexible model can have higher variance as it might overfit noise in the training data. With our method, techniques like cross-validation and regularization helped control XGBoost’s variance, resulting in strong test-set performance that indicates it generalized well. The logistic regression model, due to its simplicity and the regularizing effect of the Lasso penalty, inherently had lower variance and a lower risk of overfitting. Its bias was higher, but this bias-variance trade-off can actually be advantageous in scenarios with limited data or very noisy features. In summary, logistic regression represents a high-bias/low-variance approach, providing more stable, if less flexible predictions, whereas XGBoost is a lower-bias/higher-variance approach that can capture complex relationships at the cost of needing more careful tuning to avoid overfitting. These differences are also evident in the ROC curves, where XGBoost’s higher AUC compared to logistic regression’s reflects its lower bias and ability to capture more complex patterns,
+
+Another important consideration is interpretability. Logistic regression with Lasso yields a sparse linear model that is relatively easy to interpret. Each coefficient in the model indicates the direction and strength of the association between a predictor and the likelihood of non-default vs. default as seen in the Lasso Logistic Regression: Coefficients. 
+
+XGBoost, by contrast, is essentially a black-box model consisting of an ensemble of decision trees. Its individual predictions result from complex interactions across many trees, which makes it difficult to explain why a particular borrower was classified as high or low risk without specialized tools. While techniques such as feature importance plot can provide some insight into XGBoost’s behavior as seen in XGBoost Feature Importance, these interpretations are more approximate and complex than the clear coefficient-based explanation from logistic regression. 
+
+Therefore, there is a trade-off: XGBoost offers better raw predictive power and flexibility, whereas logistic regression offers simplicity and interpretability, which can be particularly important in domains like finance where decisions need to be transparent.
+
+
+## Summary
+
+Our findings correspond well with our expectations. Both models demonstrated good predictive performance on the credit-risk classification task. However, XGBoost achieved higher AUC and F1-score compared to Lasso-logistic regression, indicating a better ability to distinguish between defaulters and non-defaulters. This enhanced performance comes at the cost of increased model complexity and computational demand. In practice, this means that while XGBoost may offer superior accuracy, its complex, "black-box" nature can make it challenging to implement and interpret in environments where transparency is crucial. In contrast, Lasso-logistic regression yields a sparser, more interpretable model with coefficients that clearly indicate the direction and magnitude of each predictor’s impact. Therefore, in settings where explainability and ease of implementation are important, Lasso-logistic regression may be the more suitable choice despite its slightly lower predictive performance.
+
+## References
+
+1. XGBoost from [xgboost.readthedocs.io](xgboost.readthedocs.io/en/stable/tutorials/model.html).
+2. Credit Risk Dataset from [Kaggle.com](https://www.kaggle.com/datasets/laotse/credit-risk-dataset/data).
