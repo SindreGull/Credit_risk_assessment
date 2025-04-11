@@ -1,6 +1,6 @@
 # Credit_risk_assessment using Logistic Regression and XGBoost
 
-This project explores how machine learning can be used to assess credit risk by predicting whether a loan applicant is likely to default. Using a real-world dataset of 28,000+ loans, I built and compared two models:
+This project explores how machine learning can be used to assess credit risk by predicting whether a loan applicant is likely to default. Using a real-world dataset of more than $28,000$ loans, we built and compared two models:
 
 - Logistic Regression with Lasso Regularization: For interpretability and variable selection.
 - XGBoost: For high predictive accuracy.
